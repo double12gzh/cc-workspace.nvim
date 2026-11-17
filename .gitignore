@@ -2,3 +2,12 @@
 *.swp
 *.swo
 *~
+.luals-log/
+
+# Multi-agent local state & isolated worktrees
+.worktrees/
+.claude/worktrees/
+.claude/settings.local.json
+.omp/
+.pi/
+*.local.md

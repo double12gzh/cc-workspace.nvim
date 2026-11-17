@@ -1,8 +1,9 @@
 -- Public facade for `cc-workspace.nvim` (module `cc_workspace`).
 -- Core submodules form a strict 0-cycle DAG:
---   config -> icons -> worktree
---   config -> state -> projects -> render -> patches -> layout -> pickers -> sidebar -> cc_workspace
+--   config -> icons -> {winbar_highlights, keymaps, worktree}
+--   config -> state -> projects -> render -> patches -> layout -> pickers -> sidebar_actions -> sidebar -> cc_workspace
 local config = require("cc_workspace.config")
+local keymaps = require("cc_workspace.keymaps")
 local layout = require("cc_workspace.layout")
 local patches = require("cc_workspace.patches")
 local pickers = require("cc_workspace.pickers")
@@ -72,11 +73,18 @@ local M = {
 	prompt_create_worktree_chat = pickers.prompt_create_worktree_chat,
 	create_worktree_chat = pickers.create_worktree_chat,
 
-	-- Sidebar row actions
+	-- Sidebar row actions & help float
 	yank_row_path = sidebar.yank_row_path,
+	show_help_float = sidebar.show_help_float,
+
+	-- Dynamic keymap customization & unified keymap inspector
+	get_keymaps = keymaps.get_keymaps,
+	get_effective_keymaps = keymaps.get_effective_keymaps,
+	set_keymaps = keymaps.set_keymaps,
+	show_keys = keymaps.show_keys,
 }
 
----Register the 4 `:CodeCompanionWorkspace*` user commands idempotently.
+---Register the 5 `:CodeCompanionWorkspace*` / `:CodeCompanionNotificationsToggle` user commands idempotently.
 local function register_user_commands()
 	vim.api.nvim_create_user_command("CodeCompanionWorkspace", function(cmd_opts)
 		local arg = vim.trim(cmd_opts.args or "")
@@ -120,6 +128,17 @@ local function register_user_commands()
 		desc = "Create a Git Worktree and start an AI Workspace conversation in it",
 	})
 
+	vim.api.nvim_create_user_command("CodeCompanionWorkspaceKeys", function(cmd_opts)
+		local arg = vim.trim(cmd_opts.args or ""):lower()
+		M.show_keys({ mode = arg == "float" and "float" or "picker" })
+	end, {
+		nargs = "?",
+		complete = function()
+			return { "picker", "float" }
+		end,
+		desc = "Inspect, search, and dynamically rebind AI Workspace keymaps",
+	})
+
 	vim.api.nvim_create_user_command("CodeCompanionNotificationsToggle", function()
 		worktree.toggle_notifications()
 	end, {
@@ -127,7 +146,7 @@ local function register_user_commands()
 	})
 end
 
----Initialize `cc-workspace.nvim` idempotently (config, worktree engine, patches, chat keymaps, winbar, commands).
+---Initialize `cc-workspace.nvim` idempotently (config, worktree engine, patches, keymaps, winbar, commands).
 ---@param opts? CcWorkspaceConfig
 ---@return table
 function M.setup(opts)
@@ -143,11 +162,18 @@ function M.setup(opts)
 		worktrees_base_dir = merged.worktrees_base_dir,
 	})
 
+	keymaps.apply_global_keymaps()
 	patches.register_chat_keymaps(merged.chat_keymaps)
+	keymaps.apply_chat_keymaps_to_open_buffers()
 	patches.patch_persisted_session()
 	patches.patch_codecompanion_cwd()
 	patches.patch_history_ui()
 	patches.guard_history_chat_created()
+
+	if state_mod.state.sidebar_buf and vim.api.nvim_buf_is_valid(state_mod.state.sidebar_buf) then
+		sidebar.apply_sidebar_keymaps(state_mod.state.sidebar_buf)
+		render.schedule_render()
+	end
 
 	if merged.winbar ~= false then
 		pcall(function()
@@ -162,6 +188,7 @@ function M.setup(opts)
 
 	vim.schedule(function()
 		patches.register_chat_keymaps(merged.chat_keymaps)
+		keymaps.apply_chat_keymaps_to_open_buffers()
 		patches.patch_history_ui()
 		patches.guard_history_chat_created()
 	end)
@@ -173,8 +200,11 @@ end
 local LAZY_SUBMODULES = {
 	config = "cc_workspace.config",
 	icons = "cc_workspace.icons",
+	keymaps = "cc_workspace.keymaps",
+	sidebar_actions = "cc_workspace.sidebar_actions",
 	worktree = "cc_workspace.worktree",
 	winbar = "cc_workspace.winbar",
+	winbar_highlights = "cc_workspace.winbar_highlights",
 	statusline = "cc_workspace.statusline",
 	switcher = "cc_workspace.switcher",
 }

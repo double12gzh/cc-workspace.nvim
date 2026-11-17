@@ -483,8 +483,13 @@ function M.on_click(_clicks, button)
 	require("cc_workspace").toggle_side_chat()
 end
 
+---@class CcWorkspaceStatuslineOpts
+---@field min_columns? integer
+---@field cond? fun(): boolean
+---@field [string] any
+
 ---Build a complete `lualine` component table (`[1]`, `on_click`, `color`, `cond`).
----@param opts? { min_columns?: integer, cond?: fun(): boolean, [string]: any }
+---@param opts? CcWorkspaceStatuslineOpts
 ---@return table
 function M.component(opts)
 	opts = type(opts) == "table" and opts or {}

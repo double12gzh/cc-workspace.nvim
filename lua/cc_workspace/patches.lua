@@ -1,4 +1,5 @@
 local config = require("cc_workspace.config")
+local keymaps = require("cc_workspace.keymaps")
 local projects = require("cc_workspace.projects")
 local render = require("cc_workspace.render")
 local state_mod = require("cc_workspace.state")
@@ -27,18 +28,11 @@ function M.patch_persisted_session()
 	persisted.save = function(opts)
 		opts = opts or {}
 		local ws_open = state.tab ~= nil and vim.api.nvim_tabpage_is_valid(state.tab)
-		if ws_open then
+		if opts.auto and #vim.api.nvim_list_tabpages() == 1 and not state_mod.has_real_code_buffers() then
 			if
-				opts.auto
-				and #vim.api.nvim_list_tabpages() == 1
-				and state_mod.is_current_tab()
-				and not state_mod.has_real_code_buffers()
+				(ws_open and state_mod.is_current_tab())
+				or vim.bo[vim.api.nvim_get_current_buf()].filetype == "codecompanion"
 			then
-				return
-			end
-		elseif opts.auto and #vim.api.nvim_list_tabpages() == 1 and not state_mod.has_real_code_buffers() then
-			local only_buf = vim.api.nvim_get_current_buf()
-			if vim.bo[only_buf].filetype == "codecompanion" then
 				return
 			end
 		end
@@ -52,14 +46,11 @@ function M.patch_persisted_session()
 		for _, tp in ipairs(vim.api.nvim_list_tabpages()) do
 			local tabnr = vim.api.nvim_tabpage_get_number(tp)
 			local tab_cwd = vim.fn.getcwd(-1, tabnr)
-			local wins = vim.api.nvim_tabpage_list_wins(tp)
-			local split_wins = {}
-			local cc_wins = {}
-			for _, w in ipairs(wins) do
+			local split_wins, cc_wins = {}, {}
+			for _, w in ipairs(vim.api.nvim_tabpage_list_wins(tp)) do
 				if state_mod.is_split_win(w) then
 					table.insert(split_wins, w)
-					local b = vim.api.nvim_win_get_buf(w)
-					if vim.bo[b].filetype == "codecompanion" then
+					if vim.bo[vim.api.nvim_win_get_buf(w)].filetype == "codecompanion" then
 						table.insert(cc_wins, w)
 					end
 				end
@@ -88,7 +79,6 @@ function M.patch_persisted_session()
 		end
 
 		local res = orig_save(opts)
-
 		for _, item in ipairs(restored_lcds) do
 			if vim.api.nvim_win_is_valid(item.win) then
 				projects.sync_win_lcd(item.win, item.dir)
@@ -114,8 +104,9 @@ function M.guard_history_chat_created()
 		return
 	end
 	for _, ac in ipairs(autocmds) do
-		if type(ac.callback) == "function" and not guarded_history_callbacks[ac.callback] then
-			local orig_cb = ac.callback
+		local cb = ac.callback
+		if type(cb) == "function" and not guarded_history_callbacks[cb] then
+			local orig_cb = cb
 			pcall(vim.api.nvim_del_autocmd, ac.id)
 			local wrapped_cb
 			wrapped_cb = function(ev)
@@ -138,6 +129,29 @@ function M.guard_history_chat_created()
 	end
 end
 
+---Convert a keymap spec into a CodeCompanion `modes` table (or `nil` when disabled).
+---@param spec any
+---@param default_modes string[]
+---@return table|nil
+local function to_cc_modes(spec, default_modes)
+	if spec == false or spec == nil then
+		return nil
+	end
+	if type(spec) == "table" and not vim.islist(spec) then
+		return spec
+	end
+	local keys = keymaps.normalize_keys(spec)
+	if #keys == 0 then
+		return nil
+	end
+	local val = #keys == 1 and keys[1] or keys
+	local out = {}
+	for _, m in ipairs(default_modes) do
+		out[m] = val
+	end
+	return out
+end
+
 ---Register workspace-aware default chat keymaps (`q`, `<C-c>`, `}`, `{`) on `codecompanion.config` when loaded.
 ---@param keymap_opts? boolean|CcWorkspaceChatKeymapsConfig
 function M.register_chat_keymaps(keymap_opts)
@@ -158,70 +172,48 @@ function M.register_chat_keymaps(keymap_opts)
 	interactions.chat.keymaps = interactions.chat.keymaps or {}
 	local km = interactions.chat.keymaps
 
-	-- Remove legacy v19 duplicate `submit` keymap when v20 `send` is also present
 	if km.send ~= nil and km.submit ~= nil then
 		km.submit = nil
 	end
 
-	local tbl = type(keymap_opts) == "table" and keymap_opts or {}
-
-	if tbl.stop ~= false then
-		local stop_key = type(tbl.stop) == "string" and tbl.stop or "q"
-		km.stop = {
-			modes = { n = stop_key },
-			index = 5,
-			description = "Stop request, or hide/leave chat when idle",
-			callback = function(chat)
-				if chat.current_request or chat.tool_orchestrator then
-					chat:stop()
-					return
-				end
-				local ws = require("cc_workspace")
-				if ws.is_current_tab() then
-					ws.focus_sidebar()
-				elseif chat.ui and chat.ui:is_visible() then
-					chat.ui:hide()
-				end
-			end,
-		}
+	---@type table<string, any>
+	local base_chat = (config.options and config.options.keymaps and config.options.keymaps.chat)
+		or (config.defaults.keymaps and config.defaults.keymaps.chat)
+		or {}
+	local eff = vim.deepcopy(base_chat)
+	if type(keymap_opts) == "table" then
+		for k, v in pairs(keymap_opts) do
+			eff[k] = v
+		end
 	end
 
-	if tbl.close ~= false then
-		local close_modes = type(tbl.close) == "table" and tbl.close or { n = "<C-c>", i = "<C-c>" }
-		km.close = {
-			modes = close_modes,
-			index = 4,
-			description = "Close the chat buffer",
-			callback = function(chat)
-				vim.cmd("stopinsert")
-				require("cc_workspace").close_chat_safely(chat, false)
-			end,
-		}
+	local function set_cc_km(field, spec, default_modes, idx, desc, cb)
+		local modes = to_cc_modes(spec, default_modes)
+		km[field] = modes and { modes = modes, index = idx, description = desc, callback = cb } or nil
 	end
 
-	if tbl.next_chat ~= false then
-		local next_key = type(tbl.next_chat) == "string" and tbl.next_chat or "}"
-		km.next_chat = {
-			modes = { n = next_key },
-			index = 11,
-			description = "Open the next chat",
-			callback = function(chat)
-				require("cc_workspace").cycle_chat(chat, 1)
-			end,
-		}
-	end
-
-	if tbl.previous_chat ~= false then
-		local prev_key = type(tbl.previous_chat) == "string" and tbl.previous_chat or "{"
-		km.previous_chat = {
-			modes = { n = prev_key },
-			index = 12,
-			description = "Open the previous chat",
-			callback = function(chat)
-				require("cc_workspace").cycle_chat(chat, -1)
-			end,
-		}
-	end
+	set_cc_km("stop", eff.stop, { "n" }, 5, "Stop request, or hide/leave chat when idle", function(chat)
+		if chat.current_request or chat.tool_orchestrator then
+			chat:stop()
+			return
+		end
+		local ws = require("cc_workspace")
+		if ws.is_current_tab() then
+			ws.focus_sidebar()
+		elseif chat.ui and chat.ui:is_visible() then
+			chat.ui:hide()
+		end
+	end)
+	set_cc_km("close", eff.close, { "n", "i" }, 4, "Close the chat buffer", function(chat)
+		vim.cmd("stopinsert")
+		require("cc_workspace").close_chat_safely(chat, false)
+	end)
+	set_cc_km("next_chat", eff.next_chat, { "n" }, 11, "Open the next chat", function(chat)
+		require("cc_workspace").cycle_chat(chat, 1)
+	end)
+	set_cc_km("previous_chat", eff.previous_chat, { "n" }, 12, "Open the previous chat", function(chat)
+		require("cc_workspace").cycle_chat(chat, -1)
+	end)
 end
 
 ---Patch `Chat.new` so every conversation carries an explicit `cwd` and collision-free `save_id`.
@@ -304,8 +296,7 @@ local function patch_acp_cwd()
 
 	local function wrap_acp_fs_method(fn_name)
 		local orig_key = "_cc_ws_orig_" .. fn_name
-		local legacy_key = "_user_ws_orig_" .. fn_name
-		local orig_fs = acp_mod[orig_key] or acp_mod[legacy_key] or acp_mod[fn_name]
+		local orig_fs = acp_mod[orig_key] or acp_mod["_user_ws_orig_" .. fn_name] or acp_mod[fn_name]
 		if type(orig_fs) ~= "function" then
 			return
 		end
@@ -320,9 +311,7 @@ local function patch_acp_cwd()
 			then
 				local chat_cwd = projects.get_valid_chat_cwd(self and self.chat)
 				if chat_cwd then
-					params = vim.tbl_extend("force", params, {
-						path = vim.fs.joinpath(chat_cwd, params.path),
-					})
+					params = vim.tbl_extend("force", params, { path = vim.fs.joinpath(chat_cwd, params.path) })
 				end
 			end
 			return orig_fs(self, id, params)
@@ -345,8 +334,7 @@ local function patch_tool_runtime_cwd()
 			runner_mod._cc_ws_cwd_patched = true
 			runner_mod.run_tool = function(self, tool_cmd, action, args)
 				local chat = self and self.orchestrator and self.orchestrator.tools and self.orchestrator.tools.chat
-				local chat_cwd = projects.get_valid_chat_cwd(chat)
-				return projects.with_temp_cwd(chat_cwd, function()
+				return projects.with_temp_cwd(projects.get_valid_chat_cwd(chat), function()
 					return orig_run_tool(self, tool_cmd, action, args)
 				end)
 			end
@@ -358,16 +346,13 @@ local function patch_tool_runtime_cwd()
 		orch_mod._cc_ws_cwd_patched = true
 		for _, method_name in ipairs({ "setup_next_tool", "finalize_tool", "success", "error" }) do
 			local orig_key = "_cc_ws_orig_" .. method_name
-			local legacy_key = "_user_ws_orig_" .. method_name
-			local orig_m = orch_mod[orig_key] or orch_mod[legacy_key] or orch_mod[method_name]
+			local orig_m = orch_mod[orig_key] or orch_mod["_user_ws_orig_" .. method_name] or orch_mod[method_name]
 			if type(orig_m) == "function" then
 				orch_mod[orig_key] = orig_m
 				orch_mod[method_name] = function(self, ...)
 					local chat = self and self.tools and self.tools.chat
-					local chat_cwd = projects.get_valid_chat_cwd(chat)
-					local argv = { ... }
-					local argc = select("#", ...)
-					return projects.with_temp_cwd(chat_cwd, function()
+					local argv, argc = { ... }, select("#", ...)
+					return projects.with_temp_cwd(projects.get_valid_chat_cwd(chat), function()
 						return orig_m(self, unpack_fn(argv, 1, argc))
 					end)
 				end
@@ -551,6 +536,11 @@ local function on_cc_user_event(args)
 				chat.opts.save_id = state_mod.next_unique_save_id()
 			end
 		end
+		if bufnr then
+			vim.schedule(function()
+				keymaps.apply_chat_buf_keymaps(bufnr)
+			end)
+		end
 	end
 	if state_mod.is_workspace_valid() and state_mod.is_current_tab() then
 		if args.match == "CodeCompanionRequestStreaming" then
@@ -582,11 +572,9 @@ local function sync_workspace_on_enter_tick()
 	elseif state.actions.configure_sidebar_win then
 		state.actions.configure_sidebar_win()
 	end
-	-- Re-bind winnr and window-local cwd on the displayed chat if returning from another tab
 	local chat_mod = package.loaded["codecompanion.interactions.chat"]
 	if chat_mod and state.main_win and vim.api.nvim_win_is_valid(state.main_win) then
-		local mbuf = vim.api.nvim_win_get_buf(state.main_win)
-		local c = chat_mod.buf_get_chat(mbuf)
+		local c = chat_mod.buf_get_chat(vim.api.nvim_win_get_buf(state.main_win))
 		if c then
 			if c.ui then
 				c.ui.winnr = state.main_win
@@ -638,14 +626,15 @@ local function should_snapshot_inflight_chat(c, pinned_map, wt)
 	local raw_cwd = (type(c.opts) == "table" and c.opts.cwd) or c.cwd
 	local norm_cwd = projects.get_valid_chat_cwd(c) or projects.normalize_project_path(raw_cwd) or raw_cwd
 	local proj_path = projects.get_chat_project_path(c, pinned_map)
-	local skip_ephemeral = (
-		state_mod.is_ephemeral_tmp_path(raw_cwd)
-		or state_mod.is_ephemeral_tmp_path(norm_cwd)
-		or state_mod.is_ephemeral_tmp_path(proj_path)
-	)
+	if
+		(
+			state_mod.is_ephemeral_tmp_path(raw_cwd)
+			or state_mod.is_ephemeral_tmp_path(norm_cwd)
+			or state_mod.is_ephemeral_tmp_path(proj_path)
+		)
 		and not pinned_map[proj_path]
 		and not (norm_cwd and pinned_map[norm_cwd])
-	if skip_ephemeral then
+	then
 		return false
 	end
 	local st = state_mod.get_chat_status_info(c.bufnr, false)

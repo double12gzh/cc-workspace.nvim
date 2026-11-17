@@ -1,107 +1,263 @@
+local config = require("cc_workspace.config")
 local icons = require("cc_workspace.icons")
+local keymaps = require("cc_workspace.keymaps")
 local layout = require("cc_workspace.layout")
-local patches = require("cc_workspace.patches")
 local pickers = require("cc_workspace.pickers")
-local projects = require("cc_workspace.projects")
 local render = require("cc_workspace.render")
+local actions = require("cc_workspace.sidebar_actions")
 local state_mod = require("cc_workspace.state")
+local wb_hl = require("cc_workspace.winbar_highlights")
 
 local state = state_mod.state
+local help_ns = vim.api.nvim_create_namespace("CcWorkspaceHelpFloat")
+local active_help_float = nil
 
-local M = {}
+local M = {
+	yank_row_path = actions.yank_row_path,
+	open_full_history = actions.open_full_history,
+	prompt_filter = actions.prompt_filter,
+	clear_filter = actions.clear_filter,
+	rename_current_row = actions.rename_current_row,
+	delete_current_row = actions.delete_current_row,
+	inspect_current_row = actions.inspect_current_row,
+	cursor_target_path = actions.cursor_target_path,
+	cursor_project_path = actions.cursor_project_path,
+	refresh_sidebar = actions.refresh_sidebar,
+}
 
----Open CodeCompanion history picker with workspace CWD/UI patches applied.
-local function open_full_history()
-	require("codecompanion")
-	patches.patch_history_ui()
-	pcall(function()
-		vim.cmd("CodeCompanionHistory")
-	end)
+---Pad or truncate `str` to exact `target_w` terminal display cells.
+---@param str string
+---@param target_w integer
+---@return string
+local function fit_cells(str, target_w)
+	if target_w <= 0 then
+		return ""
+	end
+	local fit = wb_hl.truncate_cells(str or "", target_w)
+	local pad = target_w - wb_hl.cell_width(fit)
+	return pad > 0 and (fit .. string.rep(" ", pad)) or fit
 end
 
----Prompt for a keyword to filter sidebar conversations and projects.
-local function prompt_filter()
-	vim.ui.input({
-		prompt = "Filter projects & conversations (empty to clear): ",
-		default = state.filter or "",
-	}, function(input)
-		if input == nil then
+---Close the active floating shortcuts cheatsheet, if open.
+function M.close_help_float()
+	if active_help_float and type(active_help_float.close) == "function" then
+		active_help_float.close()
+	end
+end
+
+---Return the currently open floating shortcuts cheatsheet window and buffer IDs, if open.
+---@return integer|nil win, integer|nil buf
+function M.get_help_float_win()
+	if active_help_float and active_help_float.win and vim.api.nvim_win_is_valid(active_help_float.win) then
+		return active_help_float.win, active_help_float.buf
+	end
+	return nil, nil
+end
+
+---Refresh the currently open floating cheatsheet in place after live keymap updates.
+function M.refresh_help_float()
+	if active_help_float and type(active_help_float.refresh) == "function" then
+		active_help_float.refresh()
+	end
+end
+
+---Build categorized lines and extmark highlights for the dynamic Floating Cheatsheet (`?`).
+---@param total_w integer
+---@return string[], table[]
+local function build_cheatsheet_content(total_w)
+	local eff = keymaps.get_effective_keymaps().by_scope
+	local warn_glyph = icons.diagnostics.Warning ~= "" and icons.diagnostics.Warning or ""
+	local two_col = total_w >= 96
+	local col_w = two_col and math.floor((total_w - 3) / 2) or (total_w - 2)
+	local key_col_w = math.min(15, math.max(11, math.floor(col_w * 0.33)))
+	local desc_col_w = math.max(12, col_w - key_col_w - 2)
+
+	local function active_rows(list)
+		local out = {}
+		for _, e in ipairs(list or {}) do
+			if not e.disabled and #e.keys > 0 then
+				table.insert(out, { key = e.key_label, desc = e.desc })
+			end
+		end
+		return out
+	end
+
+	local function build_col_items(sections)
+		local items = {}
+		for s_idx, sec in ipairs(sections) do
+			if s_idx > 1 then
+				table.insert(items, { kind = "blank", text = string.rep(" ", col_w) })
+			end
+			table.insert(items, { kind = "header", text = fit_cells(" " .. sec.title, col_w) })
+			table.insert(items, { kind = "rule", text = " " .. string.rep("─", math.max(4, col_w - 2)) .. " " })
+			for _, row in ipairs(sec.rows) do
+				local k_fit = fit_cells(" " .. row.key, key_col_w)
+				local d_fit = fit_cells(row.desc, desc_col_w)
+				local full = fit_cells(k_fit .. " " .. d_fit, col_w)
+				table.insert(items, { kind = "row", text = full, key_bytes = #vim.trim(k_fit) + 1 })
+			end
+		end
+		return items
+	end
+
+	local left_secs = { { title = "Sidebar Shortcuts", rows = active_rows(eff.sidebar) } }
+	local global_rows = active_rows(eff.global)
+	if #global_rows == 0 then
+		table.insert(global_rows, { key = ":CodeCompanion…", desc = "Opt-in via opts.keymaps.global" })
+	end
+	local chat_rows = active_rows(eff.chat)
+	table.insert(chat_rows, { key = "<CR> / <C-s>", desc = "Send prompt (CodeCompanion)" })
+	table.insert(chat_rows, { key = "ga / ?", desc = "Change model / CodeCompanion help" })
+
+	local right_secs = {
+		{ title = "Global Shortcuts", rows = global_rows },
+		{ title = "Floating Switcher", rows = active_rows(eff.switcher) },
+		{ title = "Chat Buffer", rows = chat_rows },
+		{
+			title = "Agent Status Legend",
+			rows = {
+				{ key = "⠋ / ⚡ / " .. warn_glyph, desc = "Thinking / Streaming / Waiting" },
+				{ key = "✓ / ✗ / ◆ / ○", desc = "Unread / Error / Active / Idle" },
+			},
+		},
+	}
+
+	local lines, hls = {}, {}
+	local function add_cell_hls(row0, byte_off, cell)
+		if not cell or cell.kind == "blank" then
 			return
 		end
-		state.filter = vim.trim(input)
-		render.render()
-	end)
+		if cell.kind == "header" then
+			table.insert(hls, { row = row0, col_start = byte_off, col_end = byte_off + #cell.text, group = "Title" })
+		elseif cell.kind == "rule" then
+			table.insert(hls, { row = row0, col_start = byte_off, col_end = byte_off + #cell.text, group = "Comment" })
+		elseif cell.kind == "row" then
+			local kb = math.min(#cell.text, cell.key_bytes or 10)
+			table.insert(hls, { row = row0, col_start = byte_off, col_end = byte_off + kb, group = "Special" })
+		end
+	end
+
+	if two_col then
+		local l_items = build_col_items(left_secs)
+		local r_items = build_col_items(right_secs)
+		local max_n = math.max(#l_items, #r_items)
+		local blank_col = string.rep(" ", col_w)
+		local sep = " │ "
+		for i = 1, max_n do
+			local lc, rc = l_items[i], r_items[i]
+			local lt = lc and lc.text or blank_col
+			local rt = rc and rc.text or blank_col
+			local line = lt .. sep .. rt
+			table.insert(lines, line)
+			local r0 = #lines - 1
+			add_cell_hls(r0, 0, lc)
+			table.insert(hls, { row = r0, col_start = #lt, col_end = #lt + #sep, group = "WinSeparator" })
+			add_cell_hls(r0, #lt + #sep, rc)
+		end
+	else
+		local all_secs = { left_secs[1], right_secs[1], right_secs[2], right_secs[3], right_secs[4] }
+		for _, item in ipairs(build_col_items(all_secs)) do
+			local line = " " .. item.text
+			table.insert(lines, line)
+			add_cell_hls(#lines - 1, 1, item)
+		end
+	end
+	return lines, hls
 end
 
----Show a compact floating help card for AI Workspace shortcuts.
+---Show the dynamic categorized floating shortcuts card (`?` in Sidebar/Switcher or `:CodeCompanionWorkspaceKeys float`).
+---@return table
 function M.show_help_float()
-	local help_lines = {
-		" AI Workspace Sidebar Shortcuts ",
-		" ──────────────────────────────────────────── ",
-		"  <CR> / l    Open / new chat / toggle group  ",
-		"  p / <Space> Peek conversation (keep focus)  ",
-		"  a / +       Add Project (<Tab> multi + <CR>)",
-		"  A           Add Project (path Tab-complete) ",
-		"  w           New Git Worktree + Agent Chat   ",
-		"  n           New chat (in Worktree/Project)  ",
-		"  N           Pick Project(s) & start chat    ",
-		"  u           Jump to next unread / attention ",
-		"  o           Open Worktree/Project code tab  ",
-		"  r           Rename chat or Project alias    ",
-		"  d / x       Close chat / rm Worktree / Proj ",
-		"  K           Inspect Project/Worktree/chat   ",
-		"  y / Y       Copy item path / all repo paths  ",
-		"  h / za      Collapse / toggle tree group    ",
-		"  zM / zR     Collapse all / expand all       ",
-		"  1 - 9       Jump to active conversation 1-9 ",
-		"  <Tab>/<S-Tab> Next / previous item          ",
-		"  f / F       Filter by keyword / clear       ",
-		"  s / gh      Full-text history picker        ",
-		"  R           Refresh worktrees & sidebar     ",
-		"  q / Q       Back to code / close Workspace  ",
-		"",
-		" Agent Status Legend ",
-		" ──────────────────────────────────────────── ",
-		string.format("  ⠋ Thinking  ⚡ Streaming  %s Waiting  ✓ Unread", icons.diagnostics.Warning),
-		"  ✗ Error     ◆ Active     ○ Idle             ",
-		"",
-		" Inside Chat Pane (Right) ",
-		" ──────────────────────────────────────────── ",
-		"  <CR> / <C-s> Send prompt                    ",
-		"  q           Stop request, or focus sidebar  ",
-		"  ga          Change adapter / model          ",
-		"  } / {       Cycle next / previous chat      ",
-		"  ?           Show all CodeCompanion options  ",
-	}
-	local w = math.min(48, math.max(30, vim.o.columns - 4))
-	local h = math.min(#help_lines, math.max(8, vim.o.lines - 4))
+	M.close_help_float()
+	local max_w = math.max(36, vim.o.columns - 6)
+	local target_w = vim.o.columns >= 106 and math.min(max_w, 108) or math.min(max_w, 54)
+	local lines, hls = build_cheatsheet_content(target_w)
+	local h = math.min(#lines, math.max(10, vim.o.lines - 6))
 	local buf = vim.api.nvim_create_buf(false, true)
 	vim.bo[buf].bufhidden = "wipe"
 	vim.bo[buf].undolevels = -1
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, help_lines)
-	vim.bo[buf].modifiable = false
+
+	local function apply_render(r_lines, r_hls)
+		vim.bo[buf].modifiable = true
+		vim.api.nvim_buf_set_lines(buf, 0, -1, false, r_lines)
+		vim.bo[buf].modifiable = false
+		vim.api.nvim_buf_clear_namespace(buf, help_ns, 0, -1)
+		for _, hl in ipairs(r_hls) do
+			pcall(vim.api.nvim_buf_set_extmark, buf, help_ns, hl.row, hl.col_start, {
+				end_col = hl.col_end,
+				hl_group = hl.group,
+			})
+		end
+	end
+	apply_render(lines, hls)
 
 	local win = vim.api.nvim_open_win(buf, true, {
 		relative = "editor",
 		style = "minimal",
 		border = "rounded",
-		title = " Help (q/<Esc> to close) ",
+		title = string.format(" %sAI Workspace Shortcuts ", icons.get("aichat", true).Chat),
 		title_pos = "center",
-		width = w,
+		footer = " s/<C-f>:Search & Rebind (<C-r>) · q/?/<Esc>:Close ",
+		footer_pos = "center",
+		width = target_w,
 		height = h,
 		row = math.max(1, math.floor((vim.o.lines - h) / 2)),
-		col = math.max(1, math.floor((vim.o.columns - w) / 2)),
+		col = math.max(1, math.floor((vim.o.columns - target_w) / 2)),
 		zindex = 80,
 	})
+	vim.wo[win].wrap = false
+	vim.wo[win].cursorline = true
+
 	local function close_help()
+		if active_help_float and active_help_float.win == win then
+			active_help_float = nil
+		end
 		if vim.api.nvim_win_is_valid(win) then
 			vim.api.nvim_win_close(win, true)
 		end
 	end
+
+	local function refresh_help()
+		if not vim.api.nvim_win_is_valid(win) or not vim.api.nvim_buf_is_valid(buf) then
+			return
+		end
+		local nw = vim.o.columns >= 106 and math.min(math.max(36, vim.o.columns - 6), 108)
+			or math.min(math.max(36, vim.o.columns - 6), 54)
+		local nl, nh = build_cheatsheet_content(nw)
+		apply_render(nl, nh)
+		local nh_win = math.min(#nl, math.max(10, vim.o.lines - 6))
+		pcall(vim.api.nvim_win_set_config, win, {
+			width = nw,
+			height = nh_win,
+			row = math.max(1, math.floor((vim.o.lines - nh_win) / 2)),
+			col = math.max(1, math.floor((vim.o.columns - nw) / 2)),
+		})
+	end
+
+	active_help_float = { win = win, buf = buf, close = close_help, refresh = refresh_help, mode = "float" }
 	for _, k in ipairs({ "q", "<Esc>", "?", "<CR>" }) do
-		vim.keymap.set("n", k, close_help, { buffer = buf, nowait = true, silent = true })
+		vim.keymap.set("n", k, close_help, {
+			buffer = buf,
+			nowait = true,
+			silent = true,
+			desc = "cc-workspace: Close shortcuts float",
+		})
+	end
+	for _, k in ipairs({ "s", "<C-f>", "/" }) do
+		vim.keymap.set("n", k, function()
+			close_help()
+			vim.schedule(function()
+				keymaps.show_keys({ mode = "picker" })
+			end)
+		end, {
+			buffer = buf,
+			nowait = true,
+			silent = true,
+			desc = "cc-workspace: Search & live-rebind keymaps",
+		})
 	end
 	vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = close_help })
+	return active_help_float
 end
 
 ---Activate the action bound to a specific sidebar line.
@@ -128,18 +284,18 @@ function M.activate_row(row, focus_main, click_col)
 		pickers.prompt_add_project()
 	elseif act.kind == "projects_header" then
 		if click_col and act.search_col_1idx and click_col >= act.search_col_1idx then
-			open_full_history()
+			actions.open_full_history()
 		elseif click_col and act.worktree_col_1idx and click_col >= act.worktree_col_1idx then
 			pickers.prompt_create_worktree_chat()
 		else
 			pickers.prompt_add_project()
 		end
 	elseif act.kind == "filter" then
-		prompt_filter()
+		actions.prompt_filter()
 	elseif act.kind == "help" then
 		M.show_help_float()
 	elseif act.kind == "history_picker" then
-		open_full_history()
+		actions.open_full_history()
 	elseif act.kind == "active_chat" then
 		layout.show_chat(act.chat, focus_main)
 	elseif act.kind == "history_chat" then
@@ -197,556 +353,6 @@ local function step_action_row(delta)
 		end
 		vim.api.nvim_win_set_cursor(state.sidebar_win, { state.action_rows[#state.action_rows], 0 })
 	end
-end
-
----Rename an active/saved conversation or a Project display alias under the cursor.
-local function rename_current_row()
-	if not state_mod.is_workspace_valid() then
-		return
-	end
-	local row = state_mod.get_sidebar_row()
-	local act = row and state.row_actions[row] or nil
-	if not act then
-		return
-	end
-
-	if act.kind == "project" then
-		if act.path == "Other" then
-			return
-		end
-		vim.ui.input({
-			prompt = "Project display name (empty to reset to folder name): ",
-			default = act.custom_name or act.name or "",
-		}, function(new_name)
-			if new_name == nil then
-				return
-			end
-			projects.rename_project(act.path, new_name)
-		end)
-		return
-	end
-
-	if act.kind ~= "active_chat" and act.kind ~= "history_chat" then
-		return
-	end
-
-	local current_title = act.title or (act.chat and state_mod.get_chat_title(act.chat)) or ""
-	vim.ui.input({
-		prompt = "Rename conversation: ",
-		default = current_title,
-	}, function(new_title)
-		if not new_title then
-			return
-		end
-		local trimmed = vim.trim(new_title)
-		if trimmed == "" or trimmed == current_title then
-			return
-		end
-
-		local cc = package.loaded["codecompanion"]
-		local history_ext = cc and cc.extensions and cc.extensions.history
-		local loc = history_ext and history_ext.get_location and history_ext.get_location()
-		local saved_map = (history_ext and history_ext.get_chats) and history_ext.get_chats() or {}
-
-		if act.kind == "active_chat" and act.chat then
-			act.chat.opts = act.chat.opts or {}
-			act.chat.opts.title = trimmed
-			pcall(function()
-				act.chat:set_title(trimmed)
-			end)
-			local save_id = act.chat.opts.save_id
-			if save_id and loc and saved_map[save_id] ~= nil then
-				local ok_s, Storage = pcall(require, "codecompanion._extensions.history.storage")
-				if ok_s and Storage then
-					Storage.new({ dir_to_save = loc }):rename_chat(save_id, trimmed)
-				end
-			end
-		elseif act.kind == "history_chat" and act.save_id and loc then
-			local ok_s, Storage = pcall(require, "codecompanion._extensions.history.storage")
-			if ok_s and Storage then
-				Storage.new({ dir_to_save = loc }):rename_chat(act.save_id, trimmed)
-			end
-		end
-
-		state_mod.invalidate_history_cache()
-		render.render()
-		state_mod.refresh_winbars()
-	end)
-end
-
----Retarget any code tabpages whose `tcd` pointed at a deleted worktree back to `repo_root`.
----@param wt_path string
----@param repo_root string|nil
-local function retarget_worktree_tabs_to_repo(wt_path, repo_root)
-	if not repo_root or vim.fn.isdirectory(repo_root) ~= 1 then
-		return
-	end
-	local cur_tp = vim.api.nvim_get_current_tabpage()
-	for _, tp in ipairs(vim.api.nvim_list_tabpages()) do
-		if tp ~= state.tab and vim.api.nvim_tabpage_is_valid(tp) then
-			local tp_nr = vim.api.nvim_tabpage_get_number(tp)
-			local tp_cwd = projects.normalize_project_path(vim.fn.getcwd(-1, tp_nr))
-			if tp_cwd == wt_path then
-				pcall(function()
-					vim.api.nvim_set_current_tabpage(tp)
-					vim.cmd("silent! tcd " .. vim.fn.fnameescape(repo_root))
-					pcall(vim.api.nvim_tabpage_set_var, tp, "name", projects.project_basename(repo_root))
-				end)
-			end
-		end
-	end
-	if vim.api.nvim_tabpage_is_valid(cur_tp) and vim.api.nvim_get_current_tabpage() ~= cur_tp then
-		pcall(vim.api.nvim_set_current_tabpage, cur_tp)
-	end
-end
-
----Confirm and remove a linked Git Worktree row, closing its active chats and handling dirty retries.
----@param act table
-local function delete_worktree_row(act)
-	if act.is_main then
-		vim.notify(
-			"Cannot remove the main repository worktree (press d on the Project header to unpin/remove project)",
-			vim.log.levels.WARN,
-			{ title = "Git Worktree" }
-		)
-		return
-	end
-	local wt = state_mod.get_wt()
-	if not wt or type(wt.remove_worktree) ~= "function" then
-		return
-	end
-	local wt_path = act.path
-	local wt_chats = {}
-	for _, c in ipairs(state.active_chats or {}) do
-		if c and vim.api.nvim_buf_is_valid(c.bufnr) then
-			local ccwd = projects.get_valid_chat_cwd(c)
-			if ccwd and (ccwd == wt_path or ccwd:sub(1, #wt_path + 1) == wt_path .. "/") then
-				table.insert(wt_chats, c)
-			end
-		end
-	end
-	local br_icon = icons.git.Branch
-	local br_label = act.branch or projects.project_basename(wt_path)
-	local short_wt = vim.fn.fnamemodify(wt_path, ":~")
-	local prompt_msg = #wt_chats > 0
-			and string.format(
-				"Remove Git worktree '%s %s' (%s) and close %d active conversation(s)?",
-				br_icon,
-				br_label,
-				short_wt,
-				#wt_chats
-			)
-		or string.format("Remove Git worktree '%s %s' (%s)?", br_icon, br_label, short_wt)
-	local buttons = act.dirty and "&Force remove (discard uncommitted changes)\n&Cancel" or "&Remove worktree\n&Cancel"
-	local choice = vim.fn.confirm(prompt_msg, buttons, 2)
-	if choice ~= 1 then
-		return
-	end
-	for _, c in ipairs(wt_chats) do
-		layout.close_chat(c, true)
-	end
-
-	local function on_removed(ok, err, used_force)
-		if ok then
-			state.collapsed_worktrees[wt_path] = nil
-			state.expanded_all_worktrees[wt_path] = nil
-			if state.last_selected_project == wt_path then
-				state.last_selected_project = act.repo_root
-			end
-			retarget_worktree_tabs_to_repo(wt_path, act.repo_root)
-			vim.notify(
-				string.format("Removed Git worktree '%s %s'", br_icon, br_label),
-				vim.log.levels.INFO,
-				{ title = "Git Worktree" }
-			)
-			render.render()
-			return
-		end
-		local err_str = tostring(err or "unknown error")
-		local err_lc = err_str:lower()
-		local is_dirty_err = err_lc:find("uncommitted", 1, true)
-			or err_lc:find("modified", 1, true)
-			or err_lc:find("untracked", 1, true)
-			or err_lc:find("dirty", 1, true)
-		if not used_force and is_dirty_err then
-			local retry = vim.fn.confirm(
-				string.format("Worktree '%s %s' has uncommitted changes. Force remove anyway?", br_icon, br_label),
-				"&Force remove\n&Cancel",
-				2
-			)
-			if retry == 1 then
-				wt.remove_worktree(wt_path, { force = true }, function(ok2, err2)
-					on_removed(ok2, err2, true)
-				end)
-			end
-			return
-		end
-		vim.notify("Failed to remove worktree: " .. err_str, vim.log.levels.ERROR, { title = "Git Worktree" })
-	end
-
-	wt.remove_worktree(wt_path, { force = act.dirty == true }, function(ok, err)
-		on_removed(ok, err, act.dirty == true)
-	end)
-end
-
----Confirm and remove/unpin/hide a Project row under the cursor.
----@param act table
-local function delete_project_row(act)
-	local active_n = act.active_count or 0
-	local hist_n = act.history_count or 0
-	local is_cur_cwd = (act.path == projects.get_global_cwd())
-	local disp = act.name or act.path
-	if hist_n == 0 and active_n == 0 then
-		local choice = vim.fn.confirm("Remove project '" .. disp .. "' from AI Workspace?", "&Yes\n&No", 2)
-		if choice == 1 then
-			projects.remove_project(act.path, { hide = is_cur_cwd or act.path == "Other" })
-		end
-		return
-	end
-	if hist_n == 0 and active_n > 0 then
-		if act.pinned then
-			local choice = vim.fn.confirm(
-				string.format("Project '%s' has %d active conversation(s):", disp, active_n),
-				"&Remove & close active chat(s)\n&Unpin only (keep active)\n&Cancel",
-				3
-			)
-			if choice == 1 then
-				projects.remove_project(act.path, { hide = is_cur_cwd or act.path == "Other", close_active = true })
-			elseif choice == 2 then
-				projects.remove_project(act.path, { hide = is_cur_cwd or act.path == "Other", close_active = false })
-			end
-		else
-			local choice = vim.fn.confirm(
-				string.format("Remove project '%s' and close %d active conversation(s)?", disp, active_n),
-				"&Yes\n&No",
-				2
-			)
-			if choice == 1 then
-				projects.remove_project(act.path, { hide = is_cur_cwd or act.path == "Other", close_active = true })
-			end
-		end
-		return
-	end
-
-	local prompt_msg = active_n > 0
-			and string.format("Project '%s' has %d active and %d saved conversation(s):", disp, active_n, hist_n)
-		or string.format("Project '%s' has %d saved conversation(s):", disp, hist_n)
-	local choice =
-		vim.fn.confirm(prompt_msg, "&Remove from sidebar (keep history)\n&Delete project & saved chats\n&Cancel", 3)
-	if choice == 1 then
-		projects.remove_project(act.path, { hide = true, delete_chats = false, close_active = active_n > 0 })
-	elseif choice == 2 then
-		projects.remove_project(
-			act.path,
-			{ hide = is_cur_cwd or act.path == "Other", delete_chats = true, close_active = true }
-		)
-	end
-end
-
----Close an active chat, delete a history chat, remove a Git Worktree, or remove/hide a Project at the current row.
-local function delete_current_row()
-	if not state_mod.is_workspace_valid() then
-		return
-	end
-	local row = state_mod.get_sidebar_row()
-	local act = row and state.row_actions[row] or nil
-	if not act then
-		return
-	end
-
-	if act.kind == "worktree" then
-		delete_worktree_row(act)
-		return
-	end
-	if act.kind == "project" then
-		delete_project_row(act)
-		return
-	end
-	if act.kind == "active_chat" and act.chat then
-		local wt = state_mod.get_wt()
-		local has_req = wt and type(wt.has_active_request) == "function" and wt.has_active_request(act.chat.bufnr)
-			or false
-		local st = state_mod.get_chat_status_info(act.chat.bufnr, false)
-		if has_req or st.state == "thinking" or st.state == "streaming" then
-			local ok = vim.fn.confirm(
-				"Conversation is still running. Stop and close '" .. state_mod.get_chat_title(act.chat) .. "'?",
-				"&Yes\n&No",
-				2
-			)
-			if ok ~= 1 then
-				return
-			end
-		end
-		layout.close_chat(act.chat, true)
-	elseif act.kind == "history_chat" and act.save_id then
-		local choice = vim.fn.confirm("Delete saved chat '" .. (act.title or act.save_id) .. "'?", "&Yes\n&No", 2)
-		if choice == 1 then
-			local cc = package.loaded["codecompanion"]
-			if cc and cc.extensions and cc.extensions.history and cc.extensions.history.delete_chat then
-				cc.extensions.history.delete_chat(act.save_id)
-			end
-			state_mod.invalidate_history_cache()
-			render.render()
-		end
-	end
-end
-
----Display detailed path and status metadata for the Project, Worktree, or conversation under cursor.
-local function inspect_current_row()
-	local row = state_mod.get_sidebar_row()
-	local act = row and state.row_actions[row] or nil
-	if not act then
-		return
-	end
-	local br_icon = icons.git.Branch
-	if act.kind == "project" then
-		local exists = (act.path ~= "Other" and vim.fn.isdirectory(act.path) == 1) and "yes" or "missing"
-		local wt = state_mod.get_wt()
-		local wt_line = (act.worktree_count and act.worktree_count > 0)
-				and string.format("\nGit Worktrees: %d", act.worktree_count)
-			or ""
-		local wt_details = ""
-		if wt and type(wt.list_worktrees) == "function" and act.path ~= "Other" then
-			local wts = wt.list_worktrees(act.repo_root or act.path)
-			if type(wts) == "table" and #wts > 0 then
-				local parts = {}
-				for _, w in ipairs(wts) do
-					local wp = projects.normalize_project_path(w.path) or w.path
-					local br = (w.branch and w.branch ~= "") and w.branch or (w.head or "HEAD")
-					local dirty_mark = w.dirty and "*" or ""
-					table.insert(parts, string.format("  • %s %s%s: %s", br_icon, br, dirty_mark, wp))
-				end
-				wt_details = "\nWorktrees:\n" .. table.concat(parts, "\n")
-			end
-		end
-		vim.notify(
-			string.format(
-				"Project: %s\nPath: %s\nPinned: %s · Exists: %s%s\nConversations: %d active, %d saved%s",
-				act.name or act.path,
-				act.path,
-				act.pinned and "yes" or "auto",
-				exists,
-				wt_line,
-				act.active_count or 0,
-				act.history_count or 0,
-				wt_details
-			),
-			vim.log.levels.INFO,
-			{ title = "AI Workspace Project" }
-		)
-	elseif act.kind == "worktree" then
-		vim.notify(
-			string.format(
-				"Branch: %s %s%s%s\nWorktree: %s\nRepository: %s\nConversations: %d active, %d saved",
-				br_icon,
-				act.branch or projects.project_basename(act.path),
-				act.is_main and " (main)" or " (linked)",
-				act.dirty and " · dirty*" or "",
-				act.path,
-				act.repo_root or act.project_path or "",
-				act.active_count or 0,
-				act.history_count or 0
-			),
-			vim.log.levels.INFO,
-			{ title = "Git Worktree" }
-		)
-	elseif act.kind == "active_chat" and act.chat then
-		local pname, ppath = projects.get_chat_project_name(act.chat)
-		local ccwd = projects.get_valid_chat_cwd(act.chat) or ppath
-		local wt = state_mod.get_wt()
-		local br = (wt and ccwd and type(wt.get_worktree_branch) == "function") and wt.get_worktree_branch(ccwd) or nil
-		local st = state_mod.get_chat_status_info(act.chat.bufnr, false)
-		vim.notify(
-			string.format(
-				"Title: %s\nProject: %s%s\nWorking Dir: %s\nStatus: %s %s · Buffer: #%d",
-				state_mod.get_chat_title(act.chat),
-				pname,
-				(br and br ~= "") and string.format(" · %s %s", br_icon, br) or "",
-				ccwd,
-				st.icon,
-				st.state,
-				act.chat.bufnr
-			),
-			vim.log.levels.INFO,
-			{ title = "Active Agent Conversation" }
-		)
-	elseif act.kind == "history_chat" then
-		vim.notify(
-			string.format(
-				"Title: %s\nProject: %s%s\nSave ID: %s",
-				act.title or "Untitled",
-				act.project_path or "Other",
-				act.worktree_path and ("\nWorktree: " .. act.worktree_path) or "",
-				tostring(act.save_id)
-			),
-			vim.log.levels.INFO,
-			{ title = "Saved Conversation" }
-		)
-	end
-end
-
----Collect unique repository + worktree paths for `base_path`.
----@param wt table|nil
----@param base_path string
----@return string[]
-local function collect_repo_paths(wt, base_path)
-	local out = {}
-	local seen = {}
-	local function push(p)
-		local np = projects.normalize_project_path(p) or p
-		if type(np) == "string" and np ~= "" and np ~= "Other" and not seen[np] then
-			seen[np] = true
-			table.insert(out, np)
-		end
-	end
-
-	local norm_base = projects.normalize_project_path(base_path)
-	if not norm_base or norm_base == "Other" then
-		return out
-	end
-	local repo_root = (wt and type(wt.get_repo_root) == "function" and wt.get_repo_root(norm_base)) or norm_base
-	push(norm_base)
-	if wt and type(wt.list_worktrees) == "function" then
-		local wts = wt.list_worktrees(repo_root)
-		if type(wts) == "table" then
-			for _, w in ipairs(wts) do
-				if type(w) == "table" and w.path then
-					push(projects.normalize_project_path(w.path) or w.path)
-				end
-			end
-		end
-	end
-	return out
-end
-
----Collect unique repository/worktree paths or copy the current sidebar item's path to clipboard registers.
----@param all_paths? boolean When true, copy all worktree paths for the cursor project or all rendered projects from the PROJECTS header.
----@return string[]|nil
-function M.yank_row_path(all_paths)
-	local wt = state_mod.get_wt()
-	local row = state_mod.get_sidebar_row()
-	local act = row and state.row_actions[row] or nil
-	local paths = {}
-	local seen = {}
-	local function add_unique(p)
-		if type(p) == "string" and p ~= "" and p ~= "Other" and not seen[p] then
-			seen[p] = true
-			table.insert(paths, p)
-		end
-	end
-
-	if all_paths then
-		if not act or act.kind == "projects_header" then
-			for _, p in ipairs(state.rendered_project_paths or {}) do
-				if p ~= "Other" then
-					for _, rp in ipairs(collect_repo_paths(wt, p)) do
-						add_unique(rp)
-					end
-				end
-			end
-		else
-			local proj_p = act.repo_root or act.project_path or act.path
-			if type(proj_p) == "string" and proj_p ~= "" and proj_p ~= "Other" then
-				for _, rp in ipairs(collect_repo_paths(wt, proj_p)) do
-					add_unique(rp)
-				end
-			end
-		end
-	elseif act and act.kind == "projects_header" then
-		for _, p in ipairs(state.rendered_project_paths or {}) do
-			if p ~= "Other" then
-				add_unique(projects.normalize_project_path(p) or p)
-			end
-		end
-	elseif act then
-		local target = nil
-		if act.kind == "worktree" then
-			target = act.path
-		elseif act.kind == "active_chat" and act.chat then
-			target = projects.get_valid_chat_cwd(act.chat) or act.worktree_path or act.project_path
-		elseif type(act.worktree_path) == "string" and act.worktree_path ~= "" and act.worktree_path ~= "Other" then
-			target = act.worktree_path
-		elseif type(act.path) == "string" and act.path ~= "" and act.path ~= "Other" then
-			target = act.path
-		elseif type(act.project_path) == "string" and act.project_path ~= "" and act.project_path ~= "Other" then
-			target = act.project_path
-		end
-		if target then
-			add_unique(projects.normalize_project_path(target) or target)
-		end
-	end
-
-	if #paths == 0 then
-		vim.notify("No path on current line", vim.log.levels.WARN, { title = "AI Workspace" })
-		return nil
-	end
-
-	local text = table.concat(paths, "\n")
-	vim.fn.setreg('"', text)
-	pcall(vim.fn.setreg, "+", text)
-	pcall(vim.fn.setreg, "*", text)
-
-	if #paths == 1 then
-		vim.notify("Copied path: " .. paths[1], vim.log.levels.INFO, { title = "AI Workspace" })
-	else
-		local bullets = {}
-		for _, p in ipairs(paths) do
-			table.insert(bullets, "• " .. p)
-		end
-		vim.notify(
-			string.format("Copied %d paths:\n%s", #paths, table.concat(bullets, "\n")),
-			vim.log.levels.INFO,
-			{ title = "AI Workspace" }
-		)
-	end
-	return paths
-end
-
----Resolve the specific Worktree or Project directory under the sidebar cursor (`n` / `o`).
----@return string|nil
-local function cursor_target_path()
-	local row = state_mod.get_sidebar_row()
-	local act = row and state.row_actions[row] or nil
-	if not act then
-		return nil
-	end
-	if type(act.worktree_path) == "string" and act.worktree_path ~= "" and act.worktree_path ~= "Other" then
-		return act.worktree_path
-	end
-	if
-		(act.kind == "worktree" or act.kind == "project" or act.kind == "new_project_chat")
-		and type(act.path) == "string"
-		and act.path ~= ""
-		and act.path ~= "Other"
-	then
-		return act.path
-	end
-	if act.kind == "active_chat" and act.chat then
-		local ccwd = projects.get_valid_chat_cwd(act.chat)
-		if ccwd and ccwd ~= "" then
-			return ccwd
-		end
-	end
-	local p = act.project_path or act.path
-	if type(p) == "string" and p ~= "" and p ~= "Other" then
-		return p
-	end
-	return nil
-end
-
----Resolve the parent Project path under the sidebar cursor (`zM` / `zR`).
----@return string|nil
-local function cursor_project_path()
-	local row = state_mod.get_sidebar_row()
-	local act = row and state.row_actions[row] or nil
-	if not act then
-		return nil
-	end
-	local p = act.project_path or act.path
-	if type(p) == "string" and p ~= "" and p ~= "Other" then
-		return p
-	end
-	return nil
 end
 
 ---Handle `l` / `<Right>` in sidebar: expand collapsed group, step into child, or activate row.
@@ -897,8 +503,7 @@ local function make_sidebar_mouse_expr(fallback_key)
 		if state_mod.is_current_tab() and state.sidebar_win and vim.api.nvim_win_is_valid(state.sidebar_win) then
 			local pos = vim.fn.getmousepos()
 			if pos.winid == state.sidebar_win and pos.line >= 1 then
-				local clicked_line = pos.line
-				local clicked_col = pos.column
+				local clicked_line, clicked_col = pos.line, pos.column
 				vim.schedule(function()
 					handle_sidebar_mouse_click(clicked_line, clicked_col)
 				end)
@@ -910,6 +515,167 @@ local function make_sidebar_mouse_expr(fallback_key)
 		end
 		return fallback_key
 	end
+end
+
+---Apply (or hot-rebind) all configured `opts.keymaps.sidebar` bindings onto `buf`.
+---@param buf integer
+function M.apply_sidebar_keymaps(buf)
+	if not buf or not vim.api.nvim_buf_is_valid(buf) then
+		return
+	end
+	---@type table<string, any>
+	local sb = (config.options and config.options.keymaps and config.options.keymaps.sidebar)
+		or (config.defaults.keymaps and config.defaults.keymaps.sidebar)
+		or {}
+	local jump_keys = keymaps.normalize_keys(sb.jump_1_9)
+
+	keymaps.bind_buffer_keymaps(buf, {
+		{
+			spec = sb.open,
+			desc = "Open chat / toggle tree group",
+			callback = function()
+				M.activate_row(state_mod.get_sidebar_row(), true)
+			end,
+		},
+		{ spec = sb.expand_or_open, desc = "Expand group or open item", callback = handle_key_expand_or_open },
+		{ spec = sb.collapse, desc = "Collapse group / parent row", callback = handle_key_collapse_or_parent },
+		{ spec = sb.toggle_fold, desc = "Toggle Project / Worktree fold", callback = handle_key_toggle_fold },
+		{
+			spec = sb.collapse_all,
+			desc = "Collapse all groups",
+			callback = function()
+				state.focus_project_path = actions.cursor_project_path() or state.focus_project_path
+				for _, p in ipairs(state.rendered_project_paths or {}) do
+					state.collapsed_projects[p] = true
+				end
+				for _, wp in ipairs(state.rendered_worktree_paths or {}) do
+					state.collapsed_worktrees[wp] = true
+				end
+				render.render()
+			end,
+		},
+		{
+			spec = sb.expand_all,
+			desc = "Expand all groups",
+			callback = function()
+				state.focus_project_path = actions.cursor_project_path() or state.focus_project_path
+				state.collapsed_projects = {}
+				for _, p in ipairs(state.rendered_project_paths or {}) do
+					state.collapsed_projects[p] = false
+				end
+				state.collapsed_worktrees = {}
+				render.render()
+			end,
+		},
+		{
+			spec = sb.peek,
+			desc = "Peek conversation (keep sidebar focus)",
+			callback = function()
+				M.activate_row(state_mod.get_sidebar_row(), false)
+			end,
+		},
+		{
+			spec = sb.next_item,
+			desc = "Next actionable item",
+			callback = function()
+				step_action_row(1)
+			end,
+		},
+		{
+			spec = sb.prev_item,
+			desc = "Previous actionable item",
+			callback = function()
+				step_action_row(-1)
+			end,
+		},
+		{
+			spec = jump_keys,
+			desc = "Jump to active conversation 1–9",
+			callback = function(lhs)
+				local idx = tonumber(lhs)
+				if not idx then
+					for i, k in ipairs(jump_keys) do
+						if k == lhs then
+							idx = i
+							break
+						end
+					end
+				end
+				local target = idx and state.active_chats[idx] or nil
+				if target and vim.api.nvim_buf_is_valid(target.bufnr) then
+					layout.show_chat(target, true)
+				end
+			end,
+		},
+		{
+			spec = sb.new_chat,
+			desc = "New chat in Worktree / Project",
+			callback = function()
+				layout.new_chat(true, actions.cursor_target_path())
+			end,
+		},
+		{
+			spec = sb.new_project_chat,
+			desc = "Pick Project(s) & start chat",
+			callback = pickers.prompt_new_project_chat,
+		},
+		{
+			spec = sb.new_worktree_chat,
+			desc = "New Git Worktree + Agent Chat",
+			callback = pickers.prompt_create_worktree_chat,
+		},
+		{
+			spec = sb.jump_attention,
+			desc = "Jump to unread / attention Agent",
+			callback = function()
+				local wt = state_mod.get_wt()
+				if wt and type(wt.jump_to_attention) == "function" then
+					wt.jump_to_attention()
+				end
+			end,
+		},
+		{ spec = sb.add_project, desc = "Add Project (multi-pick)", callback = pickers.prompt_add_project },
+		{ spec = sb.add_project_input, desc = "Add Project (path input)", callback = pickers.prompt_add_project_input },
+		{
+			spec = sb.open_code_tab,
+			desc = "Open Worktree / Project code tab",
+			callback = function()
+				local p = actions.cursor_target_path()
+				if p then
+					layout.open_project_in_code_tab(p)
+				end
+			end,
+		},
+		{ spec = sb.rename, desc = "Rename chat or Project alias", callback = actions.rename_current_row },
+		{ spec = sb.delete, desc = "Close chat / rm Worktree / Project", callback = actions.delete_current_row },
+		{ spec = sb.inspect, desc = "Inspect Project / Worktree / chat", callback = actions.inspect_current_row },
+		{
+			spec = sb.yank_path,
+			desc = "Copy item path to clipboard",
+			callback = function()
+				actions.yank_row_path(false)
+			end,
+		},
+		{
+			spec = sb.yank_all_paths,
+			desc = "Copy all repo & worktree paths",
+			callback = function()
+				actions.yank_row_path(true)
+			end,
+		},
+		{ spec = sb.filter, desc = "Filter by keyword", callback = actions.prompt_filter },
+		{ spec = sb.clear_filter, desc = "Clear keyword filter", callback = actions.clear_filter },
+		{ spec = sb.history, desc = "Full-text saved history picker", callback = actions.open_full_history },
+		{ spec = sb.refresh, desc = "Refresh worktrees & sidebar", callback = actions.refresh_sidebar },
+		{ spec = sb.help, desc = "Show shortcuts cheatsheet", callback = M.show_help_float },
+		{ spec = sb.leave, desc = "Back to code tab (keep Workspace)", callback = layout.leave },
+		{ spec = sb.close_workspace, desc = "Close AI Workspace tab", callback = layout.close },
+	})
+
+	local mouse_opts = { buffer = buf, nowait = true, silent = true, expr = true }
+	vim.keymap.set("n", "<LeftMouse>", make_sidebar_mouse_expr("<LeftMouse>"), mouse_opts)
+	vim.keymap.set("n", "<2-LeftMouse>", make_sidebar_mouse_expr("<2-LeftMouse>"), mouse_opts)
+	vim.keymap.set({ "n", "i" }, "<LeftMouse>", make_sidebar_mouse_expr("<LeftMouse>"), { silent = true, expr = true })
 end
 
 ---Configure sidebar buffer options and keymaps.
@@ -932,137 +698,12 @@ function M.setup_sidebar_buf(buf)
 			vim.cmd("stopinsert")
 		end,
 	})
-
-	local opts = { buffer = buf, nowait = true, silent = true }
-	vim.keymap.set("n", "<CR>", function()
-		M.activate_row(state_mod.get_sidebar_row(), true)
-	end, opts)
-	vim.keymap.set("n", "l", handle_key_expand_or_open, opts)
-	vim.keymap.set("n", "<Right>", function()
-		vim.api.nvim_feedkeys("l", "m", false)
-	end, opts)
-	vim.keymap.set("n", "h", handle_key_collapse_or_parent, opts)
-	vim.keymap.set("n", "<Left>", function()
-		vim.api.nvim_feedkeys("h", "m", false)
-	end, opts)
-	vim.keymap.set("n", "za", handle_key_toggle_fold, opts)
-	vim.keymap.set("n", "zM", function()
-		state.focus_project_path = cursor_project_path() or state.focus_project_path
-		for _, p in ipairs(state.rendered_project_paths or {}) do
-			state.collapsed_projects[p] = true
-		end
-		for _, wp in ipairs(state.rendered_worktree_paths or {}) do
-			state.collapsed_worktrees[wp] = true
-		end
-		render.render()
-	end, opts)
-	vim.keymap.set("n", "zR", function()
-		state.focus_project_path = cursor_project_path() or state.focus_project_path
-		state.collapsed_projects = {}
-		for _, p in ipairs(state.rendered_project_paths or {}) do
-			state.collapsed_projects[p] = false
-		end
-		state.collapsed_worktrees = {}
-		render.render()
-	end, opts)
-	vim.keymap.set("n", "p", function()
-		M.activate_row(state_mod.get_sidebar_row(), false)
-	end, opts)
-	vim.keymap.set("n", "<Space>", function()
-		M.activate_row(state_mod.get_sidebar_row(), false)
-	end, opts)
-	vim.keymap.set("n", "<Tab>", function()
-		step_action_row(1)
-	end, opts)
-	vim.keymap.set("n", "<S-Tab>", function()
-		step_action_row(-1)
-	end, opts)
-	vim.keymap.set("n", "]c", function()
-		step_action_row(1)
-	end, opts)
-	vim.keymap.set("n", "[c", function()
-		step_action_row(-1)
-	end, opts)
-	for idx = 1, 9 do
-		vim.keymap.set("n", tostring(idx), function()
-			local target = state.active_chats[idx]
-			if target and vim.api.nvim_buf_is_valid(target.bufnr) then
-				layout.show_chat(target, true)
-			end
-		end, opts)
-	end
-	vim.keymap.set("n", "n", function()
-		layout.new_chat(true, cursor_target_path())
-	end, opts)
-	vim.keymap.set("n", "N", function()
-		pickers.prompt_new_project_chat()
-	end, opts)
-	vim.keymap.set("n", "w", function()
-		pickers.prompt_create_worktree_chat()
-	end, opts)
-	vim.keymap.set("n", "u", function()
-		local wt = state_mod.get_wt()
-		if wt and type(wt.jump_to_attention) == "function" then
-			wt.jump_to_attention()
-		end
-	end, opts)
-	vim.keymap.set("n", "a", function()
-		pickers.prompt_add_project()
-	end, opts)
-	vim.keymap.set("n", "+", function()
-		pickers.prompt_add_project()
-	end, opts)
-	vim.keymap.set("n", "A", function()
-		pickers.prompt_add_project_input()
-	end, opts)
-	vim.keymap.set("n", "o", function()
-		local p = cursor_target_path()
-		if p then
-			layout.open_project_in_code_tab(p)
-		end
-	end, opts)
-	vim.keymap.set("n", "r", rename_current_row, opts)
-	vim.keymap.set("n", "d", delete_current_row, opts)
-	vim.keymap.set("n", "x", delete_current_row, opts)
-	vim.keymap.set("n", "K", inspect_current_row, opts)
-	vim.keymap.set("n", "y", function()
-		M.yank_row_path(false)
-	end, opts)
-	vim.keymap.set("n", "gy", function()
-		M.yank_row_path(false)
-	end, opts)
-	vim.keymap.set("n", "Y", function()
-		M.yank_row_path(true)
-	end, opts)
-	vim.keymap.set("n", "f", prompt_filter, opts)
-	vim.keymap.set("n", "F", function()
-		if state.filter ~= "" then
-			state.filter = ""
-			render.render()
-		end
-	end, opts)
-	vim.keymap.set("n", "s", open_full_history, opts)
-	vim.keymap.set("n", "gh", open_full_history, opts)
-	vim.keymap.set("n", "R", function()
-		state_mod.clear_path_caches()
-		local wt = state_mod.get_wt()
-		if wt and type(wt.invalidate_git_cache) == "function" then
-			pcall(wt.invalidate_git_cache)
-		end
-		render.render()
-	end, opts)
-	vim.keymap.set("n", "?", M.show_help_float, opts)
-	vim.keymap.set("n", "g?", M.show_help_float, opts)
-	vim.keymap.set("n", "q", layout.leave, opts)
-	vim.keymap.set("n", "Q", layout.close, opts)
-
-	local mouse_opts = { buffer = buf, nowait = true, silent = true, expr = true }
-	vim.keymap.set("n", "<LeftMouse>", make_sidebar_mouse_expr("<LeftMouse>"), mouse_opts)
-	vim.keymap.set("n", "<2-LeftMouse>", make_sidebar_mouse_expr("<2-LeftMouse>"), mouse_opts)
-	vim.keymap.set({ "n", "i" }, "<LeftMouse>", make_sidebar_mouse_expr("<LeftMouse>"), { silent = true, expr = true })
+	M.apply_sidebar_keymaps(buf)
 end
 
 state.actions.setup_sidebar_buf = M.setup_sidebar_buf
+state.actions.apply_sidebar_keymaps = M.apply_sidebar_keymaps
+state.actions.format_sidebar_footer = keymaps.format_sidebar_footer
 if
 	state.sidebar_buf
 	and vim.api.nvim_buf_is_valid(state.sidebar_buf)

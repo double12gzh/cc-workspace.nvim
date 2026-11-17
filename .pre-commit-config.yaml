@@ -1,0 +1,51 @@
+default_install_hook_types:
+  - pre-commit
+  - commit-msg
+  - pre-push
+
+repos:
+  - repo: local
+    hooks:
+      - id: file-hygiene
+        name: File hygiene, JSON & shell checks
+        entry: ./scripts/check.sh hygiene
+        language: system
+        types_or: [file, symlink]
+        stages: [pre-commit]
+
+      - id: stylua
+        name: StyLua formatting check
+        entry: ./scripts/check.sh fmt
+        language: system
+        files: \.lua$
+        stages: [pre-commit]
+
+      - id: repo-architecture-lint
+        name: Architecture, AST & agent customization lint
+        entry: ./scripts/check.sh arch
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-commit]
+
+      - id: lua-ls
+        name: LuaLS static type & diagnostic check
+        entry: ./scripts/check.sh lsp
+        language: system
+        files: (\.lua$|\.luarc\.json$)
+        pass_filenames: false
+        stages: [pre-commit]
+
+      - id: commit-msg-lint
+        name: Conventional Commit & AI Co-Authored-By check
+        entry: ./scripts/check.sh commit-msg
+        language: system
+        stages: [commit-msg]
+
+      - id: headless-e2e-tests
+        name: Isolated Neovim headless E2E suite
+        entry: ./scripts/check.sh test
+        language: system
+        files: ^(lua/|tests/|scripts/)
+        pass_filenames: false
+        stages: [pre-commit, pre-push]
